@@ -1,283 +1,252 @@
 import streamlit as st
-import jieba
-from collections import Counter
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
-import re
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import warnings
-warnings.filterwarnings("ignore")
+import jieba
+from collections import Counter
+import re
+from pyecharts import options as opts
+from pyecharts.charts import WordCloud, Bar, Line, Pie, Radar, Scatter, HeatMap, TreeMap
+from streamlit_echarts import st_pyecharts
+import numpy as np
 
-# -------------------------- 基础配置 --------------------------
-plt.rcParams["font.family"] = ["WenQuanYi Micro Hei", "Heiti TC", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
+# 页面配置
+st.set_page_config(page_title="文本词频分析工具", layout="wide")
 
-st.set_page_config(
-    page_title="文本分析工具（支持URL爬取）",
-    page_icon="📝",
-    layout="wide"
+# 侧边栏配置
+st.sidebar.title("可视化筛选")
+chart_type = st.sidebar.selectbox(
+    "选择图表类型",
+    [
+        "词云图", "柱状图(前20)", "折线图(前20)", "饼图(前10)",
+        "雷达图(前8)", "散点图(前20)", "热力图(前15)", "矩形树图(前15)"
+    ]
 )
+min_freq = st.sidebar.slider("过滤低频词（最小词频）", 1, 20, 2)
 
-# -------------------------- 全局变量（解决作用域问题） --------------------------
-# 用session_state存储爬取的文本，避免变量丢失
-if "crawled_text" not in st.session_state:
-    st.session_state.crawled_text = ""
+# 主页面标题
+st.title("URL文本采集与词频分析系统")
 
-# -------------------------- 核心函数 --------------------------
-# 1. 网页内容爬取（适配HTTP协议+强制文本存储）
-def crawl_webpage(url):
-    """爬取指定URL（兼容HTTP/HTTPS，强制存储到session_state）"""
+# 1. URL输入区域
+url = st.text_input("请输入文章URL地址", placeholder="例如：https://www.example.com/article")
+submit_btn = st.button("开始分析")
+
+# 定义停用词（基础版）
+STOP_WORDS = set([
+    '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一', '一个', '上', '也',
+    '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好', '自己', '这', '那',
+    '他', '她', '它', '我们', '你们', '他们', '这里', '那里', '然后', '但是', '所以', '因为',
+    '对于', '关于', '虽然', '如果', '就是', '还有', '什么', '怎么', '为什么', '多少', '几'
+])
+
+
+def fetch_url_content(url):
+    """抓取URL文本内容"""
     try:
-        # 补全URL协议（若用户只输入域名）
-        if not url.startswith(("http://", "https://")):
-            url = "http://" + url
-            st.warning(f"自动补全协议：{url}")
-        
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Upgrade-Insecure-Requests": "1"  # 适配HTTP跳转HTTPS
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
-        # 增加重试机制
-        for retry in range(2):
-            try:
-                response = requests.get(
-                    url, 
-                    headers=headers, 
-                    timeout=20,
-                    allow_redirects=True,
-                    verify=False,
-                    stream=False
-                )
-                break
-            except:
-                if retry == 1:
-                    raise
-        
-        # 强制编码适配（解决中文乱码）
-        encodings = ["utf-8", "gbk", "gb2312", "gb18030", response.apparent_encoding]
-        content = ""
-        for encoding in encodings:
-            try:
-                response.encoding = encoding
-                content = response.text
-                if content:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.encoding = response.apparent_encoding
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # 提取正文（通用规则，适配大多数文章页面）
+        text = ''
+        # 尝试常见的正文标签
+        for tag in ['article', 'div[class*="content"]', 'div[class*="article"]', 'main', 'body']:
+            elements = soup.select(tag)
+            if elements:
+                text = '\n'.join([elem.get_text(strip=True) for elem in elements])
+                if text:
                     break
-            except:
-                continue
-        
-        soup = BeautifulSoup(content, "html.parser")
-        for script in soup(["script", "style", "iframe", "noscript"]):
-            script.decompose()
-        
-        # 提取正文（适配目标网站的div/p结构）
-        content = ""
-        # 优先提取所有可见文本（适配目标网站的无规则文本）
-        all_text = soup.get_text(separator=" ", strip=True)
-        # 过滤连续空白符
-        content = re.sub(r"\s+", " ", all_text)
-        
-        # 强制存储到session_state
-        st.session_state.crawled_text = content
-        
-        # 预览展示
-        if len(content) < 50:
-            st.warning("⚠️ 爬取到的内容过短，可能是反爬或网页无有效文本")
-        else:
-            st.subheader("爬取到的内容预览")
-            preview_text = content[:800] + "..." if len(content) > 800 else content
-            st.text_area("内容预览", preview_text, height=200, key="preview")
-        
-        return content
-    
-    except requests.exceptions.Timeout:
-        st.error("❌ 请求超时：网页响应时间超过20秒")
-        st.session_state.crawled_text = ""
-        return ""
-    except requests.exceptions.ConnectionError:
-        st.error("❌ 连接失败：无法访问该网址（检查URL是否正确/网站是否可访问）")
-        st.session_state.crawled_text = ""
-        return ""
-    except requests.exceptions.InvalidURL:
-        st.error("❌ 无效URL：请输入完整的网址（示例：https://www.baidu.com）")
-        st.session_state.crawled_text = ""
-        return ""
+
+        # 清洗文本
+        text = re.sub(r'\s+', ' ', text)  # 去除多余空格
+        text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', ' ', text)  # 只保留中文、字母、数字
+        return text
     except Exception as e:
-        st.error(f"❌ 爬取失败：{str(e)[:100]}")
-        st.session_state.crawled_text = ""
+        st.error(f"抓取URL失败：{str(e)}")
         return ""
 
-# 2. 文本预处理（适配目标网站的半结构化文本）
-def preprocess_text(text):
-    """清洗文本并分词（适配含数字/重复内容的半结构化文本）"""
-    # 调试：输出session_state中的文本
-    st.sidebar.subheader("🔍 调试信息")
-    st.sidebar.write(f"Session文本长度：{len(text)} 字符")
-    st.sidebar.write(f"Session文本前100字符：{text[:100]}")
-    
-    if not text or len(text) < 10:
-        st.sidebar.warning("预处理：文本过短，返回空")
-        return []
-    
-    # 【关键修改：仅过滤纯数字/日期，保留中文词汇】
-    # 步骤1：移除纯数字串（如2025-07、14 2012-12等）
-    text = re.sub(r"\d+[-/]\d+[-/]\d+|\d+", "", text)
-    # 步骤2：仅保留中文（移除所有非中文字符）
-    text = re.sub(r"[^\u4e00-\u9fa5]", "", text)
-    # 步骤3：移除连续重复的短文本（适配目标网站的重复内容）
-    text = re.sub(r"(.{2,5})\1{3,}", r"\1", text)  # 移除重复3次以上的2-5字短语
-    
-    st.sidebar.write(f"清洗后文本长度：{len(text)} 字符")
-    st.sidebar.write(f"清洗后文本前100字符：{text[:100]}")
-    
+
+def analyze_word_freq(text, min_freq):
+    """分词并统计词频"""
     if not text:
-        st.sidebar.warning("预处理：清洗后无内容，返回空")
-        return []
-    
-    # 分词（适配重复词汇）
-    jieba.setLogLevel(20)
+        return {}
+
+    # 分词
     words = jieba.lcut(text)
-    
-    # 极简停用词表（仅过滤最核心）
-    stop_words = {"的", "了", "是", "在", "和", "有", "都", "而", "及", "与", "之", "于", "也", "还", "这", "那"}
-    words = [word for word in words if word not in stop_words and len(word) >= 2]
-    words = [word for word in words if word.strip()]
-    
-    st.sidebar.write(f"分词后数量：{len(words)} 个词")
-    st.sidebar.write(f"分词后前20个：{words[:20]}")
-    
-    return words
+    # 过滤停用词和短词，以及低频词
+    filtered_words = [
+        word for word in words
+        if len(word) > 1 and word not in STOP_WORDS
+    ]
+    # 统计词频
+    word_freq = Counter(filtered_words)
+    # 过滤低频词
+    word_freq = {k: v for k, v in word_freq.items() if v >= min_freq}
+    # 按词频排序
+    sorted_word_freq = dict(sorted(word_freq.items(), key=lambda x: x[1], reverse=True))
+    return sorted_word_freq
 
-# 3. 词云生成（兼容云端）
-def generate_wordcloud(words):
-    try:
-        wordcloud = WordCloud(
-            width=800,
-            height=400,
-            background_color="white",
-            font_path=None,
-            max_words=100,
-            colormap="viridis",
-            random_state=42
-        ).generate(" ".join(words))
-        return wordcloud
-    except Exception as e:
-        st.warning(f"⚠️ 词云生成异常：{str(e)[:50]}，使用降级方案")
-        wordcloud = WordCloud(
-            width=800,
-            height=400,
-            background_color="white",
-            max_words=100,
-            random_state=42
-        ).generate(" ".join(words))
-        return wordcloud
 
-# -------------------------- 页面交互 --------------------------
-st.title("📝 文本分析工具（支持URL爬取）")
-st.markdown("### 支持：网页内容爬取、分词、词频统计、关键词提取、词云生成")
+def create_chart(word_freq, chart_type):
+    """根据选择创建不同的图表"""
+    if not word_freq:
+        st.warning("暂无足够的词频数据展示")
+        return
 
-# 选择输入方式
-input_mode = st.radio(
-    "请选择输入方式", 
-    ["手动输入文本", "输入URL爬取网页内容"], 
-    horizontal=True,
-    key="input_mode"
-)
+    # 取前N个词（根据不同图表调整）
+    top_n = {
+        "词云图": len(word_freq),
+        "柱状图(前20)": 20,
+        "折线图(前20)": 20,
+        "饼图(前10)": 10,
+        "雷达图(前8)": 8,
+        "散点图(前20)": 20,
+        "热力图(前15)": 15,
+        "矩形树图(前15)": 15
+    }[chart_type]
 
-# 手动输入文本逻辑
-if input_mode == "手动输入文本":
-    st.session_state.crawled_text = st.text_area(
-        "请输入需要分析的文本（支持中文）",
-        height=200,
-        placeholder="例如：人工智能是未来科技的核心方向，人工智能正在改变各行各业...",
-        key="text_input"
-    )
-# URL爬取逻辑
-else:
-    url = st.text_input(
-        "请输入网页URL（支持HTTP/HTTPS）",
-        placeholder="例如：http://zpy.cstam.org.cn/",
-        key="url_input"
-    )
-    if st.button("📤 爬取网页内容", type="secondary", key="crawl_btn"):
-        if url:
-            with st.spinner("正在爬取网页内容...（最多等待20秒）"):
-                crawl_webpage(url)
-        else:
-            st.warning("⚠️ 请输入有效的URL！")
+    top_words = list(word_freq.items())[:top_n]
+    words = [item[0] for item in top_words]
+    freqs = [item[1] for item in top_words]
 
-# 分析按钮逻辑（读取session_state中的文本）
-analyze_disabled = False if st.session_state.crawled_text.strip() else True
-if st.button("🚀 开始分析", type="primary", key="analyze_btn", disabled=analyze_disabled):
-    # 从session_state读取文本
-    text_source = st.session_state.crawled_text
-    words = preprocess_text(text_source)
-    
-    if not words:
-        st.warning("""
-        ⚠️ 未提取到可分析的中文词汇！可能原因：
-        1. 爬取的文本以英文/数字/特殊符号为主；
-        2. 文本中仅包含停用词（如“的、了、是”等）；
-        3. 网页内容为图片/视频，无文字信息。
-        
-        建议：
-        - 更换爬取目标（优先选择新闻、博客等纯文本网页）；
-        - 手动补充中文文本后再分析。
-        """)
-    else:
-        word_count = Counter(words[:5000])
-        top_n = word_count.most_common(min(20, len(word_count)))
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader(f"1. 词频统计（TOP{len(top_n)}）")
-            df = pd.DataFrame(top_n, columns=["词汇", "出现次数"])
-            st.dataframe(df, use_container_width=True)
-            
-            st.subheader("2. 词频可视化")
-            if len(top_n) >= 3:
-                try:
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    top_10 = top_n[:min(10, len(top_n))]
-                    ax.bar([w[0] for w in top_10], [w[1] for w in top_10], color="#1f77b4")
-                    ax.set_xlabel("词汇", fontsize=12)
-                    ax.set_ylabel("出现次数", fontsize=12)
-                    ax.set_title(f"TOP{len(top_10)}词汇词频分布", fontsize=14)
-                    plt.xticks(rotation=45)
-                    st.pyplot(fig)
-                except Exception as e:
-                    st.error(f"⚠️ 图表生成失败：{str(e)[:50]}")
-            else:
-                st.info("⚠️ 有效词汇不足3个，无法生成柱状图")
-        
-        with col2:
-            st.subheader("3. 核心关键词")
-            top_keywords = min(8, len(top_n))
-            if top_keywords > 0:
-                keywords = [w[0] for w in top_n[:top_keywords]]
-                st.markdown(f"**{', '.join(keywords)}**")
-            else:
-                st.info("⚠️ 无有效关键词")
-            
-            st.subheader("4. 词云展示")
-            try:
-                wordcloud = generate_wordcloud(words)
-                fig2, ax2 = plt.subplots(figsize=(10, 6))
-                ax2.imshow(wordcloud, interpolation="bilinear")
-                ax2.axis("off")
-                st.pyplot(fig2)
-            except Exception as e:
-                st.error(f"⚠️ 词云生成失败：{str(e)[:50]}")
+    # 创建不同类型的图表
+    if chart_type == "词云图":
+        c = (
+            WordCloud()
+                .add("", top_words, word_size_range=[20, 100])
+                .set_global_opts(title_opts=opts.TitleOpts(title="词频词云图"))
+        )
+        st_pyecharts(c)
 
-# 页脚
-st.divider()
-st.caption("""
-✨ 适配说明：针对http://zpy.cstam.org.cn/这类半结构化网页做了特殊适配；
-✨ 核心优化：解决HTTP协议爬取、文本传递丢失、重复内容过滤问题；
+    elif chart_type == "柱状图(前20)":
+        c = (
+            Bar()
+                .add_xaxis(words)
+                .add_yaxis("词频", freqs)
+                .reversal_axis()  # 横向柱状图
+                .set_global_opts(
+                title_opts=opts.TitleOpts(title="词频排名前20柱状图"),
+                xaxis_opts=opts.AxisOpts(name="词频"),
+                yaxis_opts=opts.AxisOpts(name="词汇")
+            )
+        )
+        st_pyecharts(c)
+
+    elif chart_type == "折线图(前20)":
+        c = (
+            Line()
+                .add_xaxis(words)
+                .add_yaxis("词频", freqs, markpoint_opts=opts.MarkPointOpts(data=[opts.MarkPointItem(type_="max")]))
+                .set_global_opts(
+                title_opts=opts.TitleOpts(title="词频排名前20折线图"),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=-45))
+            )
+        )
+        st_pyecharts(c)
+
+    elif chart_type == "饼图(前10)":
+        c = (
+            Pie()
+                .add("", top_words)
+                .set_global_opts(title_opts=opts.TitleOpts(title="词频排名前10饼图"))
+                .set_series_opts(label_opts=opts.LabelOpts(formatter="{b}: {c} ({d}%)"))
+        )
+        st_pyecharts(c)
+
+    elif chart_type == "雷达图(前8)":
+        # 雷达图需要调整数据格式
+        max_freq = max(freqs) if freqs else 1
+        c = (
+            Radar()
+                .add_schema(schema=[opts.RadarIndicatorItem(name=word, max_=max_freq) for word in words])
+                .add("词频", [freqs])
+                .set_global_opts(title_opts=opts.TitleOpts(title="词频排名前8雷达图"))
+        )
+        st_pyecharts(c)
+
+    elif chart_type == "散点图(前20)":
+        c = (
+            Scatter()
+                .add_xaxis(words)
+                .add_yaxis("词频", freqs)
+                .set_global_opts(
+                title_opts=opts.TitleOpts(title="词频排名前20散点图"),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=-45)),
+                yaxis_opts=opts.AxisOpts(name="词频")
+            )
+        )
+        st_pyecharts(c)
+
+    elif chart_type == "热力图(前15)":
+        # 热力图数据格式：[[行, 列, 值], ...]
+        heat_data = []
+        for i in range(len(words)):
+            heat_data.append([0, i, freqs[i]])  # 单行热力图
+        c = (
+            HeatMap()
+                .add_xaxis(words)
+                .add_yaxis("词频", ["频次"], heat_data)
+                .set_global_opts(
+                title_opts=opts.TitleOpts(title="词频排名前15热力图"),
+                visualmap_opts=opts.VisualMapOpts(min_=min(freqs), max_=max(freqs))
+            )
+        )
+        st_pyecharts(c)
+
+    elif chart_type == "矩形树图(前15)":
+        # 矩形树图数据格式
+        treemap_data = [{"name": word, "value": freq} for word, freq in top_words]
+        c = (
+            TreeMap()
+                .add("", treemap_data)
+                .set_global_opts(title_opts=opts.TitleOpts(title="词频排名前15矩形树图"))
+        )
+        st_pyecharts(c)
+
+
+# 主逻辑执行
+if submit_btn and url:
+    with st.spinner("正在抓取URL内容..."):
+        text = fetch_url_content(url)
+
+    if text:
+        with st.spinner("正在分词并统计词频..."):
+            word_freq = analyze_word_freq(text, min_freq)
+
+        # 展示词频排名前20
+        st.subheader("词频排名前20词汇")
+        top_20 = list(word_freq.items())[:20]
+        for idx, (word, freq) in enumerate(top_20, 1):
+            st.write(f"{idx}. {word} - 出现次数：{freq}")
+
+        # 展示可视化图表
+        st.subheader(f"可视化展示：{chart_type}")
+        create_chart(word_freq, chart_type)
+
+        # 展示原始文本预览（可选）
+        with st.expander("查看抓取的文本内容（前2000字）"):
+            st.text(text[:2000] + "..." if len(text) > 2000 else text)
+elif submit_btn:
+    st.warning("请输入有效的URL地址")
+
+# 说明文档
+st.sidebar.markdown("""
+### 使用说明
+1. 输入文章URL地址
+2. 调整低频词过滤阈值
+3. 选择需要展示的图表类型
+4. 点击"开始分析"按钮
+5. 查看词频排名和可视化图表
+
+### 支持的图表类型
+- 词云图：直观展示词汇出现频率
+- 柱状图：对比前20词汇的词频
+- 折线图：展示前20词汇的词频趋势
+- 饼图：展示前10词汇的占比
+- 雷达图：多维展示前8词汇的词频
+- 散点图：展示前20词汇的词频分布
+- 热力图：颜色深浅展示前15词汇词频
+- 矩形树图：层级展示前15词汇词频
 """)
